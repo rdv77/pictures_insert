@@ -28,10 +28,10 @@ test('standalone HTTP: auth, upload, edit with mock xAI, ZIP, restart and sessio
   const originalFetch=globalThis.fetch;const origin='http://localhost:3000';
   const password='test-password-123456789';const authorization='Basic '+Buffer.from('admin:'+password).toString('base64');
   const png=Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aS2kAAAAASUVORK5CYII=','base64');
-  let providerCalls=0,providerMode='success';
+  let providerCalls=0,providerMode='success',lastPrompt='';
   globalThis.fetch=async(input,options)=>{
     if(String(input)==='https://api.x.ai/v1/images/edits'){
-      providerCalls++;const body=JSON.parse(options.body);assert.equal(body.images.length,2);assert.equal(body.model,'grok-imagine-image-2.0');assert.equal(body.response_format,'b64_json');
+      providerCalls++;const body=JSON.parse(options.body);lastPrompt=body.prompt;assert.equal(body.images.length,2);assert.equal(body.model,'grok-imagine-image-2.0');assert.equal(body.response_format,'b64_json');
       if(providerMode==='network')throw new TypeError('simulated network failure');
       if(providerMode==='invalid')return new Response('<html>upstream error</html>');
       if(providerMode==='download')return Response.json({data:[{url:'https://imgen.x.ai/test-result.png'}]});
@@ -59,9 +59,15 @@ test('standalone HTTP: auth, upload, edit with mock xAI, ZIP, restart and sessio
     await app.storage.put(`sessions/${cookie.split('=')[1]}/jobs/${id}`,JSON.stringify(job),{customMetadata:{job:JSON.stringify(job)}});
     assert.equal((await api('edit',{id,key:'fake-test-key-12345'})).status,200);assert.equal(providerCalls,1);
     const isolated=await fetch(base+'/api/studio?action=state',{headers:{authorization}});assert.equal((await isolated.json()).jobs.length,0);
+    assert.equal((await api('instruction',{instruction:'Keep both posters the same size'})).status,200);
+    assert.equal((await api('instruction',{instruction:'   '})).status,400);
+    const changedState=await(await api('state')).json();
+    assert.equal(changedState.config.instruction,'Keep both posters the same size');
+    assert.equal(changedState.jobs[0].status,'done');
+    assert.equal(providerCalls,1);
     const beforeRegen=(await(await api('state')).json()).jobs[0];
-    const regenRequest={id,key:'fake-test-key-12345',regenerate:true,expectedUpdated:beforeRegen.updated};
-    assert.equal((await api('edit',regenRequest)).status,200);assert.equal(providerCalls,2);
+    const regenRequest={id,key:'fake-test-key-12345',regenerate:true,expectedUpdated:beforeRegen.updated,instruction:'Keep both posters the same size; preserve the left edge'};
+    assert.equal((await api('edit',regenRequest)).status,200);assert.equal(providerCalls,2);assert.ok(lastPrompt.includes(regenRequest.instruction));
     assert.equal((await api('edit',regenRequest)).status,409);assert.equal(providerCalls,2);
     const beforeFailure=(await(await api('state')).json()).jobs[0];
     const savedKey=`sessions/${cookie.split('=')[1]}/results/${id}`;

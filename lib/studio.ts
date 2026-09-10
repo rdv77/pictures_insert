@@ -108,6 +108,14 @@ export async function handleStudio(request: Request, bucket: StorageBucket): Pro
       const s = await state(bucket,root); if (s.jobs.some(j => j.photo.id === body.id || j.poster.id === body.id)) fail('Файл используется в очереди');
       await bucket.delete(`${root}assets/${body.id}`); return json({ok:true});
     }
+    if (action === 'instruction') {
+      if (typeof body.instruction !== 'string' || !body.instruction.trim() || body.instruction.length > 3000) fail('Введите инструкцию от 1 до 3000 символов');
+      const object = await bucket.get(`${root}config`); if (!object) fail('Сначала создайте очередь',409);
+      const config = await object.json<Config>();
+      config.instruction = body.instruction;
+      if (!await bucket.put(`${root}config`, JSON.stringify(config), {onlyIf:{etagMatches:object.etag}})) fail('Настройки изменились в другой вкладке. Повторите сохранение.',409);
+      return json({ok:true});
+    }
     if (action === 'plan' || action === 'extend') {
       const s = await state(bucket,root); const posters = s.assets.filter(a => a.kind === 'poster');
       const photos = s.assets.filter(a => a.kind === 'photo' && !s.jobs.some(j => j.photo.id === a.id));
@@ -128,6 +136,7 @@ export async function handleStudio(request: Request, bucket: StorageBucket): Pro
       job.status = 'pending'; delete job.error; job.updated = Date.now(); await putJob(bucket,root,job,object.etag); return json({ok:true});
     }
     if (action === 'edit') {
+      if (body.instruction !== undefined && (typeof body.instruction !== 'string' || !body.instruction.trim() || body.instruction.length > 3000)) fail('Введите инструкцию от 1 до 3000 символов');
       if (typeof body.key !== 'string' || body.key.length < 10 || body.key.length > 300 || /\s/.test(body.key)) fail('Введите корректный API-ключ xAI',401);
       const {object,job} = await getJob(bucket,root,body.id);
       const regenerate = body.regenerate === true;
@@ -142,6 +151,7 @@ export async function handleStudio(request: Request, bucket: StorageBucket): Pro
       }
       const configObject = await bucket.get(`${root}config`); if (!configObject) fail('Настройки очереди не найдены',409);
       const config = await configObject.json<Config>(); job.status = 'running'; job.updated = Math.max(Date.now(),job.updated+1);
+      const editInstruction = body.instruction ?? config.instruction;
       job.needsRegeneration = regenerate || job.needsRegeneration || false;
       job.attemptId = crypto.randomUUID();
       const claimed = await putJob(bucket,root,job,object.etag);
@@ -152,7 +162,7 @@ export async function handleStudio(request: Request, bucket: StorageBucket): Pro
         const images = [];
         for (const asset of [job.photo,job.poster]) { const file = await bucket.get(`${root}assets/${asset.id}`); if (!file) throw new ApiError('Исходное изображение не найдено',404); images.push({type:'image_url',url:`data:${file.httpMetadata?.contentType};base64,${Buffer.from(await file.arrayBuffer()).toString('base64')}`}); }
         stage = 'request_xai';
-        const pendingResponse = fetch('https://api.x.ai/v1/images/edits', { method:'POST', headers:{'Content-Type':'application/json',Authorization:`Bearer ${body.key}`}, body:JSON.stringify({model:config.model,prompt:prompt(config.instruction),images,n:1,response_format:'b64_json'}), signal:AbortSignal.timeout(240000) });
+        const pendingResponse = fetch('https://api.x.ai/v1/images/edits', { method:'POST', headers:{'Content-Type':'application/json',Authorization:`Bearer ${body.key}`}, body:JSON.stringify({model:config.model,prompt:prompt(editInstruction),images,n:1,response_format:'b64_json'}), signal:AbortSignal.timeout(240000) });
         images.length = 0;
         const response = await pendingResponse;
         upstreamStatus = response.status;
