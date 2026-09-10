@@ -1,0 +1,19 @@
+name: afisha-studio
+services:
+  app:
+    build: .
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:3000:3000"
+    environment:
+      HOST: 0.0.0.0
+      PORT: 3000
+      DATA_DIR: /data
+      APP_ORIGIN: ${APP_ORIGIN:-http://localhost:3000}
+      APP_PASSWORD: ${APP_PASSWORD:?Set APP_PASSWORD in .env (16+ characters)}
+      MAX_ACTIVE_EDITS: ${MAX_ACTIVE_EDITS:-4}
+    volumes:
+      - afisha-data:/data
+    stop_grace_period: 6m
+volumes:
+  afisha-data:

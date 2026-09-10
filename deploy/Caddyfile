@@ -1,0 +1,4 @@
+# Replace afisha.example.com with your domain; point its DNS A/AAAA to the server.
+afisha.example.com {
+    reverse_proxy 127.0.0.1:3000
+}
