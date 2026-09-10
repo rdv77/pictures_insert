@@ -59,6 +59,20 @@ test('standalone HTTP: auth, upload, edit with mock xAI, ZIP, restart and sessio
     await app.storage.put(`sessions/${cookie.split('=')[1]}/jobs/${id}`,JSON.stringify(job),{customMetadata:{job:JSON.stringify(job)}});
     assert.equal((await api('edit',{id,key:'fake-test-key-12345'})).status,200);assert.equal(providerCalls,1);
     const isolated=await fetch(base+'/api/studio?action=state',{headers:{authorization}});assert.equal((await isolated.json()).jobs.length,0);
+    const beforeRegen=(await(await api('state')).json()).jobs[0];
+    const regenRequest={id,key:'fake-test-key-12345',regenerate:true,expectedUpdated:beforeRegen.updated};
+    assert.equal((await api('edit',regenRequest)).status,200);assert.equal(providerCalls,2);
+    assert.equal((await api('edit',regenRequest)).status,409);assert.equal(providerCalls,2);
+    const beforeFailure=(await(await api('state')).json()).jobs[0];
+    const savedKey=`sessions/${cookie.split('=')[1]}/results/${id}`;
+    const oldEtag=(await app.storage.head(savedKey)).etag;
+    providerMode='invalid';
+    assert.equal((await api('edit',{...regenRequest,expectedUpdated:beforeFailure.updated})).status,502);
+    assert.equal((await app.storage.head(savedKey)).etag,oldEtag);
+    assert.equal((await(await api('state')).json()).jobs[0].needsRegeneration,true);
+    await api('retry',{id});providerMode='success';const callsBeforeRetry=providerCalls;
+    assert.equal((await api('edit',{id,key:'fake-test-key-12345'})).status,200);
+    assert.equal(providerCalls,callsBeforeRetry+1); // Old stored image must not skip regeneration.
     assert.equal((await api('reset',{})).status,200);assert.equal((await(await api('state')).json()).assets.length,0);
     for(const [mode,stage]of [['network','request_xai'],['invalid','decode_response'],['download','download_result']]){
       providerMode=mode;

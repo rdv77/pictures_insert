@@ -130,14 +130,20 @@ export async function handleStudio(request: Request, bucket: StorageBucket): Pro
     if (action === 'edit') {
       if (typeof body.key !== 'string' || body.key.length < 10 || body.key.length > 300 || /\s/.test(body.key)) fail('Введите корректный API-ключ xAI',401);
       const {object,job} = await getJob(bucket,root,body.id);
-      if (job.status === 'done') return json(job);
-      if (job.status !== 'pending') fail('Задание уже запущено. Обновите его состояние.',409);
-      if (await bucket.head(`${root}results/${job.id}`)) {
-        job.status='done'; job.result=`/api/studio?action=file&kind=result&id=${job.id}`; job.updated=Date.now(); delete job.error;
+      const regenerate = body.regenerate === true;
+      if (regenerate && (body.expectedUpdated !== job.updated || !['done','error'].includes(job.status))) fail('Результат уже изменён или обрабатывается. Обновите очередь перед перегенерацией.',409);
+      if (!regenerate && job.status === 'done') return json(job);
+      if (!regenerate && job.status !== 'pending') fail('Задание уже запущено. Обновите его состояние.',409);
+      const saved = await bucket.head(`${root}results/${job.id}`);
+      if (!regenerate && saved && (!job.needsRegeneration || (job.attemptId && saved.customMetadata?.attemptId === job.attemptId))) {
+        job.status='done'; job.result=`/api/studio?action=file&kind=result&id=${job.id}`; job.updated=Math.max(Date.now(),job.updated+1); delete job.error;
+        job.needsRegeneration=false;
         await putJob(bucket,root,job,object.etag); return json(job);
       }
       const configObject = await bucket.get(`${root}config`); if (!configObject) fail('Настройки очереди не найдены',409);
-      const config = await configObject.json<Config>(); job.status = 'running'; job.updated = Date.now();
+      const config = await configObject.json<Config>(); job.status = 'running'; job.updated = Math.max(Date.now(),job.updated+1);
+      job.needsRegeneration = regenerate || job.needsRegeneration || false;
+      job.attemptId = crypto.randomUUID();
       const claimed = await putJob(bucket,root,job,object.etag);
       let stage: EditStage = 'read_inputs';
       let upstreamStatus: number | undefined;
@@ -165,8 +171,9 @@ export async function handleStudio(request: Request, bucket: StorageBucket): Pro
         stage = 'validate_result';
         const mime = imageType(bytes); if (!mime || bytes.length > 18*1024*1024) throw new ApiError('Некорректный результат модели',502);
         stage = 'save_result';
-        await bucket.put(`${root}results/${job.id}`,bytes,{httpMetadata:{contentType:mime}});
-        job.status='done'; job.result=`/api/studio?action=file&kind=result&id=${job.id}`; job.updated=Date.now(); delete job.error;
+        await bucket.put(`${root}results/${job.id}`,bytes,{httpMetadata:{contentType:mime},customMetadata:{attemptId:job.attemptId}});
+        job.status='done'; job.result=`/api/studio?action=file&kind=result&id=${job.id}`; job.updated=Math.max(Date.now(),job.updated+1); delete job.error;
+        job.needsRegeneration=false;
         stage = 'save_status';
         await putJob(bucket,root,job,claimed.etag); return json(job);
       } catch (error) {
