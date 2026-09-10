@@ -2,6 +2,7 @@ import type { StorageBucket, StorageObject } from './storage-types.ts';
 import { Buffer } from 'node:buffer';
 import { assignments, imageType, filename, prompt, type Asset, type Job, type Config } from './batch.ts';
 import { zipStream, type ZipEntry } from './zip.ts';
+import { editFailure, errorKind, type EditStage } from './edit-errors.ts';
 
 const MAX_FILE = 10 * 1024 * 1024;
 class ApiError extends Error { status: number; constructor(message: string, status = 400) { super(message); this.status = status; } }
@@ -52,6 +53,16 @@ export async function handleStudio(request: Request, bucket: StorageBucket): Pro
     if (!sid) { if (request.method !== 'GET' || action !== 'state') fail('Сначала откройте приложение', 401); sid = newSession(); fresh = true; }
     const root = `sessions/${sid}/`;
     if (request.method === 'GET') {
+      if (action === 'connection-check') {
+        try {
+          const probe = await fetch('https://api.x.ai/v1/models', {signal:AbortSignal.timeout(15000)});
+          await probe.body?.cancel();
+          return json({reachable:true,httpStatus:probe.status,message:'API xAI отвечает. Ключ и генерация этим запросом не проверялись.'});
+        } catch(error) {
+          console.error('xai_connection_check_failed',{kind:errorKind(error)});
+          return json({reachable:false,error:'Сервер приложения не смог связаться с API xAI. Платная генерация не запускалась.'},502);
+        }
+      }
       if (action === 'state') { const result = json(await state(bucket,root)); if (fresh) result.headers.set('Set-Cookie',cookie(sid,url.protocol === 'https:')); return result; }
       if (action === 'file') {
         const id = url.searchParams.get('id'), kind = url.searchParams.get('kind');
@@ -121,28 +132,46 @@ export async function handleStudio(request: Request, bucket: StorageBucket): Pro
       const {object,job} = await getJob(bucket,root,body.id);
       if (job.status === 'done') return json(job);
       if (job.status !== 'pending') fail('Задание уже запущено. Обновите его состояние.',409);
+      if (await bucket.head(`${root}results/${job.id}`)) {
+        job.status='done'; job.result=`/api/studio?action=file&kind=result&id=${job.id}`; job.updated=Date.now(); delete job.error;
+        await putJob(bucket,root,job,object.etag); return json(job);
+      }
       const configObject = await bucket.get(`${root}config`); if (!configObject) fail('Настройки очереди не найдены',409);
       const config = await configObject.json<Config>(); job.status = 'running'; job.updated = Date.now();
       const claimed = await putJob(bucket,root,job,object.etag);
+      let stage: EditStage = 'read_inputs';
+      let upstreamStatus: number | undefined;
+      const started = Date.now();
       try {
         const images = [];
         for (const asset of [job.photo,job.poster]) { const file = await bucket.get(`${root}assets/${asset.id}`); if (!file) throw new ApiError('Исходное изображение не найдено',404); images.push({type:'image_url',url:`data:${file.httpMetadata?.contentType};base64,${Buffer.from(await file.arrayBuffer()).toString('base64')}`}); }
-        const response = await fetch('https://api.x.ai/v1/images/edits', { method:'POST', headers:{'Content-Type':'application/json',Authorization:`Bearer ${body.key}`}, body:JSON.stringify({model:config.model,prompt:prompt(config.instruction),images,n:1,response_format:'url'}), signal:AbortSignal.timeout(240000) });
+        stage = 'request_xai';
+        const pendingResponse = fetch('https://api.x.ai/v1/images/edits', { method:'POST', headers:{'Content-Type':'application/json',Authorization:`Bearer ${body.key}`}, body:JSON.stringify({model:config.model,prompt:prompt(config.instruction),images,n:1,response_format:'b64_json'}), signal:AbortSignal.timeout(240000) });
         images.length = 0;
+        const response = await pendingResponse;
+        upstreamStatus = response.status;
         if (!response.ok) { await response.body?.cancel(); throw new ApiError(response.status === 401 || response.status === 403 ? 'xAI отклонил ключ или доступ к модели. Проверьте ключ и разрешения.' : response.status === 429 ? 'Лимит xAI или недостаточно средств. Проверьте счёт и повторите позже.' : `xAI вернул ошибку ${response.status}. Запрос не повторялся автоматически.`,502); }
-        const payload = JSON.parse(new TextDecoder().decode(await bytesLimited(response, 24*1024*1024)));
+        stage = 'read_response';
+        const responseBytes = await bytesLimited(response, 25*1024*1024);
+        stage = 'decode_response';
+        const payload = JSON.parse(new TextDecoder().decode(responseBytes));
         const output = payload.data?.[0]; let bytes: Uint8Array;
         if (typeof output?.b64_json === 'string') bytes = Buffer.from(output.b64_json,'base64');
         else if (typeof output?.url === 'string') {
+          stage = 'download_result';
           const target = new URL(output.url); if (target.protocol !== 'https:' || !(target.hostname === 'x.ai' || target.hostname.endsWith('.x.ai'))) throw new ApiError('Модель вернула неподдерживаемый адрес результата',502);
           const image = await fetch(target,{redirect:'error',signal:AbortSignal.timeout(45000)}); if (!image.ok) throw new ApiError('Не удалось получить результат xAI',502); bytes = await bytesLimited(image,18*1024*1024);
         } else throw new ApiError('Модель не вернула изображение. Проверьте инструкции и попробуйте снова.',502);
+        stage = 'validate_result';
         const mime = imageType(bytes); if (!mime || bytes.length > 18*1024*1024) throw new ApiError('Некорректный результат модели',502);
+        stage = 'save_result';
         await bucket.put(`${root}results/${job.id}`,bytes,{httpMetadata:{contentType:mime}});
         job.status='done'; job.result=`/api/studio?action=file&kind=result&id=${job.id}`; job.updated=Date.now(); delete job.error;
+        stage = 'save_status';
         await putJob(bucket,root,job,claimed.etag); return json(job);
       } catch (error) {
-        job.status='error'; job.updated=Date.now(); job.error=error instanceof ApiError ? error.message : 'Связь с моделью прервалась. Запрос мог быть оплачен. Автоматического повтора нет.';
+        console.error('image_edit_failed', {jobId:job.id,stage,kind:errorKind(error),upstreamStatus,elapsedMs:Date.now()-started});
+        job.status='error'; job.updated=Date.now(); job.error=error instanceof ApiError ? `${error.message} Код: ${stage}.` : editFailure(stage,error);
         await putJob(bucket,root,job,claimed.etag); return json({error:job.error},502);
       }
     }

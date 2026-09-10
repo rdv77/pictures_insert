@@ -28,12 +28,16 @@ test('standalone HTTP: auth, upload, edit with mock xAI, ZIP, restart and sessio
   const originalFetch=globalThis.fetch;const origin='http://localhost:3000';
   const password='test-password-123456789';const authorization='Basic '+Buffer.from('admin:'+password).toString('base64');
   const png=Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aS2kAAAAASUVORK5CYII=','base64');
-  let providerCalls=0;
+  let providerCalls=0,providerMode='success';
   globalThis.fetch=async(input,options)=>{
     if(String(input)==='https://api.x.ai/v1/images/edits'){
-      providerCalls++;const body=JSON.parse(options.body);assert.equal(body.images.length,2);assert.equal(body.model,'grok-imagine-image-2.0');
+      providerCalls++;const body=JSON.parse(options.body);assert.equal(body.images.length,2);assert.equal(body.model,'grok-imagine-image-2.0');assert.equal(body.response_format,'b64_json');
+      if(providerMode==='network')throw new TypeError('simulated network failure');
+      if(providerMode==='invalid')return new Response('<html>upstream error</html>');
+      if(providerMode==='download')return Response.json({data:[{url:'https://imgen.x.ai/test-result.png'}]});
       return Response.json({data:[{b64_json:png.toString('base64')}]});
     }
+    if(String(input)==='https://imgen.x.ai/test-result.png')throw new TypeError('simulated download failure');
     return originalFetch(input,options);
   };
   try{
@@ -50,8 +54,21 @@ test('standalone HTTP: auth, upload, edit with mock xAI, ZIP, restart and sessio
     const denied=await fetch(base+'/api/studio?action=reset',{method:'POST',headers:{authorization,cookie,origin:'https://wrong.example','Content-Type':'application/json'},body:'{}'});assert.equal(denied.status,403);
     await app.close();app=await startServer({dataDir:dir,port:0,password,origin});base=`http://127.0.0.1:${app.server.address().port}`;
     assert.equal((await(await api('state')).json()).jobs[0].status,'done');
+    // Simulate a status write failure after the result was stored: no paid retry.
+    const job=(await(await api('state')).json()).jobs[0];job.status='pending';
+    await app.storage.put(`sessions/${cookie.split('=')[1]}/jobs/${id}`,JSON.stringify(job),{customMetadata:{job:JSON.stringify(job)}});
+    assert.equal((await api('edit',{id,key:'fake-test-key-12345'})).status,200);assert.equal(providerCalls,1);
     const isolated=await fetch(base+'/api/studio?action=state',{headers:{authorization}});assert.equal((await isolated.json()).jobs.length,0);
     assert.equal((await api('reset',{})).status,200);assert.equal((await(await api('state')).json()).assets.length,0);
+    for(const [mode,stage]of [['network','request_xai'],['invalid','decode_response'],['download','download_result']]){
+      providerMode=mode;
+      for(const kind of ['photo','poster']){const form=new FormData();form.set('kind',kind);form.set('file',new Blob([png]),kind+'.png');await api('upload',form);}
+      await api('plan',{model:'grok-imagine-image-2.0',mode:'balanced',instruction:'test'});
+      const next=(await(await api('state')).json()).jobs[0];const before=providerCalls;
+      const failure=await api('edit',{id:next.id,key:'fake-test-key-12345'});assert.equal(failure.status,502);
+      assert.match((await failure.json()).error,new RegExp(stage));assert.equal(providerCalls,before+1);
+      assert.equal((await(await api('state')).json()).jobs[0].status,'error');await api('reset',{});
+    }
   }finally{globalThis.fetch=originalFetch;await app?.close();await cleanup(dir);}
 });
 

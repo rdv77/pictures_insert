@@ -30,5 +30,5 @@ export async function runConcurrent<T>(items: readonly T[], options: Options<T>)
 export function editMemoryCost(photoBytes?: number, posterBytes?: number) {
   const fallback = 10 * 1024 * 1024;
   // Allow for base64 / JSON copies and response buffers in the Worker runtime.
-  return 24 * 1024 * 1024 + 5 * ((photoBytes ?? fallback) + (posterBytes ?? fallback));
+  return 40 * 1024 * 1024 + 5 * ((photoBytes ?? fallback) + (posterBytes ?? fallback));
 }

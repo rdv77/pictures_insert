@@ -30,6 +30,8 @@ curl -u admin -b cookies.txt -H 'Origin: http://localhost:3000' -F 'kind=photo' 
 | GET file | Дополнительно kind=asset/result&id=UUID | Бинарное изображение |
 | GET export | Нет | application/zip: done-изображения и report.json |
 
+GET /api/studio?action=connection-check проверяет сетевую доступность xAI запросом списка моделей без ключа. Возвращает reachable и httpStatus; не проверяет ключ и не запускает генерацию.
+
 Отдельно GET /healthz возвращает текст ok и не требует авторизации.
 
 ## Типы
