@@ -18,7 +18,10 @@ async function list(bucket: R2Bucket, prefix: string) {
 }
 async function state(bucket: R2Bucket, root: string) {
   const [a, j, c] = await Promise.all([list(bucket, `${root}assets/`), list(bucket, `${root}jobs/`), bucket.get(`${root}config`)]);
-  return { assets: a.map(o => JSON.parse(o.customMetadata!.asset) as Asset).sort((x,y) => x.created-y.created), jobs: j.map(o => JSON.parse(o.customMetadata!.job) as Job).sort((x,y) => x.created-y.created), config: c ? await c.json<Config>() : null };
+  const assets = a.map(o => ({ ...JSON.parse(o.customMetadata!.asset) as Asset, size: o.size })).sort((x,y) => x.created-y.created);
+  const byId = new Map(assets.map(asset => [asset.id, asset]));
+  const jobs = j.map(o => { const job = JSON.parse(o.customMetadata!.job) as Job; return { ...job, photo: byId.get(job.photo.id) ?? job.photo, poster: byId.get(job.poster.id) ?? job.poster }; }).sort((x,y) => x.created-y.created);
+  return { assets, jobs, config: c ? await c.json<Config>() : null };
 }
 async function putJob(bucket: R2Bucket, root: string, job: Job, etag?: string) {
   const result = await bucket.put(`${root}jobs/${job.id}`, JSON.stringify(job), { customMetadata: { job: JSON.stringify(job) }, onlyIf: etag ? { etagMatches: etag } : { etagDoesNotMatch: '*' } });
@@ -79,7 +82,7 @@ async function handle(request: Request): Promise<Response> {
       const mime = imageType(new Uint8Array(await file.slice(0,16).arrayBuffer())); if (!mime) fail('Поддерживаются только JPG, PNG и WebP');
       const current = await state(bucket,root);
       if (current.assets.filter(a => a.kind === kind).length >= (kind === 'photo' ? 500 : 50)) fail('Достигнут лимит файлов в серии');
-      const id = crypto.randomUUID(); const asset: Asset = { id, kind, name: filename(file.name), created:Date.now(), url:`/api/studio?action=file&kind=asset&id=${id}` };
+      const id = crypto.randomUUID(); const asset: Asset = { id, kind, size: file.size, name: filename(file.name), created:Date.now(), url:`/api/studio?action=file&kind=asset&id=${id}` };
       await bucket.put(`${root}assets/${id}`, file.stream(), { httpMetadata: { contentType:mime }, customMetadata: { asset:JSON.stringify(asset) } }); return json(asset);
     }
     if (!request.headers.get('content-type')?.includes('application/json')) fail('Ожидается JSON');

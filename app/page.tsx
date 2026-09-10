@@ -7,14 +7,15 @@ import { Input } from '@/components/ui/input';
 import { Textarea } from '@/components/ui/textarea';
 import { NativeSelect } from '@/components/ui/native-select';
 import { Progress } from '@/components/ui/progress';
+import { runConcurrent, editMemoryCost } from '@/lib/concurrent';
 import { AlertDialog, AlertDialogContent, AlertDialogTitle, AlertDialogDescription, AlertDialogFooter, AlertDialogCancel, AlertDialogAction } from '@/components/ui/alert-dialog';
-type Asset = { id: string; name: string; kind: 'photo' | 'poster'; url: string };
+type Asset = { id: string; name: string; kind: 'photo' | 'poster'; url: string; size?: number };
 type Job = { id: string; photo: Asset; poster: Asset; status: 'pending' | 'running' | 'done' | 'error'; error?: string; result?: string };
 type Snapshot = { assets: Asset[]; jobs: Job[]; config?: {model:string; mode:string; instruction:string} | null };
 const labels = { pending: 'В очереди', running: 'Обработка', done: 'Готово', error: 'Ошибка' };
-async function request(action: string, body?: unknown) {
+async function request<T = Snapshot>(action: string, body?: unknown): Promise<T> {
   const response = await fetch(`/api/studio?action=${action}`, body instanceof FormData ? { method: 'POST', body } : body ? { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) } : {});
-  const data = await response.json() as Snapshot & {error?: string};
+  const data = await response.json() as T & {error?: string};
   if (!response.ok) throw new Error(data.error || 'Не удалось выполнить запрос');
   return data;
 }
@@ -26,6 +27,7 @@ export default function Home() {
   const [instruction, setInstruction] = useState('Заменить все старые афиши на рекламной тумбе новым макетом. Сохранить окружение, форму тумбы, ракурс, освещение и тени.');
   const [selected, setSelected] = useState<string | null>(null), [exporting, setExporting] = useState(false);
   const [resetOpen, setResetOpen] = useState(false);
+  const [concurrency, setConcurrency] = useState(2);
   const stop = useRef(false), gate = useRef(false);
   const photos = data.assets.filter(a => a.kind === 'photo'), posters = data.assets.filter(a => a.kind === 'poster');
   const done = data.jobs.filter(j => j.status === 'done').length;
@@ -59,12 +61,24 @@ export default function Home() {
       setRunning(true); stop.current = false;
       try {
         const queue = (await refresh()).jobs.filter(j => j.status === 'pending');
-        for (const job of single ? queue.slice(0, 1) : queue) {
-          if (stop.current) break;
-          setSelected(job.id); setData(d => ({ ...d, jobs: d.jobs.map(j => j.id === job.id ? { ...j, status: 'running' } : j) }));
-          await request('edit', { id: job.id, key }); await refresh();
-        }
-        if (stop.current) setMessage('Очередь приостановлена. Текущий запрос завершён.');
+        const result = await runConcurrent(single ? queue.slice(0, 1) : queue, {
+          concurrency: single ? 1 : concurrency,
+          budget: 100 * 1024 * 1024,
+          cost: job => editMemoryCost(job.photo.size, job.poster.size),
+          shouldStop: () => stop.current,
+          run: async job => {
+            setSelected(job.id); setData(d => ({ ...d, jobs: d.jobs.map(j => j.id === job.id ? { ...j, status: 'running' } : j) }));
+            try {
+              const updated = await request<Job>('edit', { id: job.id, key });
+              setData(d => ({ ...d, jobs: d.jobs.map(j => j.id === job.id ? updated : j) }));
+            } catch (error) {
+              setMessage(`${(error as Error).message} Новые запросы остановлены; ожидаем уже отправленные.`);
+              throw error;
+            }
+          },
+        });
+        if (result.errors.length) setMessage(`${(result.errors[0] as Error).message} Очередь остановлена, уже отправленные запросы завершены. Повторов не было.`);
+        else if (stop.current) setMessage('Очередь приостановлена. Все уже отправленные запросы завершены.');
       } finally { setRunning(false); }
     });
   }
@@ -104,9 +118,10 @@ export default function Home() {
         <label className="field-label" htmlFor="model">Модель</label><NativeSelect id="model" value={model} disabled={busy || !!data.jobs.length} onChange={e => setModel(e.target.value)}><option value="grok-imagine-image-2.0">Grok Imagine Image 2.0</option><option value="grok-imagine-image">Grok Imagine Image</option></NativeSelect>
         <label className="field-label" htmlFor="api-key">API-ключ xAI</label><Input id="api-key" type="password" placeholder="xai-…" autoComplete="off" value={key} disabled={running} onChange={e => setKey(e.target.value)} /><p className="help">Ключ хранится только в памяти вкладки. <a href="https://console.x.ai" target="_blank" rel="noreferrer">Получить ключ ↗</a></p>
         <div className="divider" /><label className="field-label" htmlFor="mode">Распределение макетов</label><NativeSelect id="mode" value={mode} disabled={busy || !!data.jobs.length} onChange={e => setMode(e.target.value)}><option value="balanced">Случайно, поровну</option><option value="random">Полностью случайно</option><option value="sequential">По очереди</option></NativeSelect><p className="help">{mode === 'balanced' ? 'Каждый макет используется одинаково часто, с разницей не больше одной фотографии.' : mode === 'random' ? 'Независимый случайный выбор для каждой фотографии.' : 'Макеты чередуются в порядке загрузки.'}</p>
+        <label className="field-label" htmlFor="concurrency">Одновременные запросы</label><NativeSelect id="concurrency" value={concurrency} disabled={busy} onChange={e => setConcurrency(Number(e.target.value))}><option value={1}>1 — последовательно</option><option value={2}>2 — рекомендуется</option><option value={3}>3 — параллельно</option><option value={4}>4 — параллельно</option></NativeSelect><p className="help">До {concurrency} фотографий одновременно. Для крупных файлов параллельность снижается автоматически. При ошибке или лимите xAI новые запросы останавливаются. Проба всегда обрабатывает одну фотографию.</p>
         <label className="field-label" htmlFor="instruction">Что заменить</label><Textarea id="instruction" value={instruction} maxLength={3000} disabled={busy || !!data.jobs.length} onChange={e => setInstruction(e.target.value)} rows={5} /><p className="help">Один новый макет на фотографию. Он применяется ко всем указанным афишам в кадре.</p>
         <div className="batch-summary"><div><span>Фотографий</span><strong>{photos.length}</strong></div><div><span>Новых макетов</span><strong>{posters.length}</strong></div></div>
-        {!data.jobs.length ? <Button className="primary-action" disabled={busy || !photos.length || !posters.length || !instruction.trim()} onClick={() => action(async () => { await request('plan', { mode, model, instruction }); })}><Shuffle /> Создать очередь</Button> : <><Button className="primary-action" disabled={busy || !key.trim() || !data.jobs.some(j => j.status === 'pending')} onClick={() => processBatch(false)}><Play /> {done ? 'Продолжить обработку' : 'Запустить всю серию'}</Button><Button variant="outline" className="secondary-action" disabled={busy || !key.trim() || !data.jobs.some(j => j.status === 'pending')} onClick={() => processBatch(true)}>Проба на 1 фотографии</Button>{running && <Button variant="outline" className="secondary-action" onClick={() => { stop.current = true; setMessage('Остановимся после текущей фотографии.'); }}><Square size={14} /> Приостановить очередь</Button>}<Button variant="ghost" className="secondary-action" disabled={busy} onClick={() => action(async () => { await request('extend', { mode, model, instruction }); })}>Добавить новые фото в очередь</Button></>}
+        {!data.jobs.length ? <Button className="primary-action" disabled={busy || !photos.length || !posters.length || !instruction.trim()} onClick={() => action(async () => { await request('plan', { mode, model, instruction }); })}><Shuffle /> Создать очередь</Button> : <><Button className="primary-action" disabled={busy || !key.trim() || !data.jobs.some(j => j.status === 'pending')} onClick={() => processBatch(false)}><Play /> {done ? 'Продолжить обработку' : 'Запустить всю серию'}</Button><Button variant="outline" className="secondary-action" disabled={busy || !key.trim() || !data.jobs.some(j => j.status === 'pending')} onClick={() => processBatch(true)}>Проба на 1 фотографии</Button>{running && <Button variant="outline" className="secondary-action" onClick={() => { stop.current = true; setMessage('Новые запросы остановлены. Ожидаем уже отправленные фотографии.'); }}><Square size={14} /> Приостановить очередь</Button>}<Button variant="ghost" className="secondary-action" disabled={busy} onClick={() => action(async () => { await request('extend', { mode, model, instruction }); })}>Добавить новые фото в очередь</Button></>}
         <p className="help billing">Обработка оплачивается с вашего счёта xAI. Сначала проверьте одну фотографию: модель может изменить мелкий текст или детали сцены.</p><p className="help">Во время обработки держите вкладку открытой. Файлы и результаты сохраняются для этого браузера.</p>
         {data.assets.length > 0 && <Button variant="ghost" className="secondary-action" disabled={busy} onClick={() => setResetOpen(true)}>Начать новую серию</Button>}
       </aside></div><footer><span>АФИША / STUDIO</span><span>Исходники сохраняются отдельно от результатов</span></footer>
@@ -114,4 +129,3 @@ export default function Home() {
     </main>
   </div>;
 }
-

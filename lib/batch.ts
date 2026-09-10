@@ -1,4 +1,4 @@
-export type Asset = { id: string; name: string; kind: 'photo' | 'poster'; url: string; created: number };
+export type Asset = { id: string; name: string; kind: 'photo' | 'poster'; url: string; created: number; size?: number };
 export type Job = { id: string; photo: Asset; poster: Asset; status: 'pending' | 'running' | 'done' | 'error'; created: number; updated: number; error?: string; result?: string };
 export type Config = { model: string; mode: string; instruction: string };
 export function assignments(count: number, posterCount: number, mode: string, random = Math.random): number[] {
