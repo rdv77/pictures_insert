@@ -8,6 +8,7 @@ import { Textarea } from '@/components/ui/textarea';
 import { NativeSelect } from '@/components/ui/native-select';
 import { Progress } from '@/components/ui/progress';
 import { Checkbox } from '@/components/ui/checkbox';
+import { zipImages } from '@/lib/import-zip';
 import { runConcurrent, editMemoryCost } from '@/lib/concurrent';
 import { AlertDialog, AlertDialogContent, AlertDialogTitle, AlertDialogDescription, AlertDialogFooter, AlertDialogCancel, AlertDialogAction } from '@/components/ui/alert-dialog';
 type Asset = { id: string; name: string; kind: 'photo' | 'poster'; url: string; size?: number };
@@ -50,11 +51,25 @@ export default function Home() {
   async function upload(files: FileList | File[], kind: Asset['kind']) {
     await action(async () => {
       const items = Array.from(files);
-      for (let i = 0; i < items.length; i++) {
-        setMessage(`Загрузка ${i + 1} из ${items.length}: ${items[i].name}`);
-        const form = new FormData(); form.set('file', items[i]); form.set('kind', kind); await request('upload', form);
+      let uploaded = 0;
+      const errors: string[] = [];
+      const snapshot = await refresh();
+      let remaining = (kind === 'photo' ? 500 : 50) - snapshot.assets.filter(a => a.kind === kind).length;
+      async function send(file: File) {
+        if (remaining <= 0) throw new Error('Достигнут лимит изображений в серии');
+        setMessage(`Загрузка: ${file.name}. Уже добавлено: ${uploaded}`);
+        const form = new FormData(); form.set('file', file); form.set('kind', kind); await request('upload', form);
+        uploaded++; remaining--;
       }
-      setMessage(`Загружено файлов: ${items.length}`);
+      for (const file of items) {
+        try {
+          if (/\.zip$/i.test(file.name) || ['application/zip','application/x-zip-compressed'].includes(file.type)) {
+            setMessage(`Распаковка ${file.name}… Уже добавлено: ${uploaded}`);
+            for await (const image of zipImages(file, remaining)) await send(image);
+          } else await send(file);
+        } catch (e) { errors.push(`${file.name}: ${(e as Error).message}`); }
+      }
+      setMessage(`Добавлено изображений: ${uploaded}.${errors.length ? ' Не всё загружено: ' + errors.join('; ') : ' Можно создавать очередь или добавить фото в существующую.'}`);
     });
   }
   async function processBatch(single: boolean, regenerate = false) {
@@ -99,10 +114,10 @@ export default function Home() {
   function UploadZone({ kind, count }: { kind: Asset['kind']; count: number }) {
     // eslint-disable-next-line jsx-a11y/prefer-tag-over-role -- The composite drop target contains a native input, which cannot be nested in a button.
     return <div role="button" tabIndex={0} aria-label={kind === 'photo' ? 'Загрузить фотографии' : 'Загрузить новые афиши'} onClick={e => { if (e.target === e.currentTarget || !(e.target instanceof HTMLInputElement)) e.currentTarget.querySelector('input')?.click(); }} onKeyDown={e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); e.currentTarget.querySelector('input')?.click(); } }} className={`dropzone ${busy || !ready ? 'disabled' : ''}`} onDragOver={e => e.preventDefault()} onDrop={e => { e.preventDefault(); if (ready && !busy) void upload(e.dataTransfer.files, kind); }}>
-      <input type="file" accept="image/jpeg,image/png,image/webp" multiple disabled={busy || !ready} onChange={e => { if (e.target.files) void upload(e.target.files, kind); e.target.value = ''; }} />
+      <input type="file" accept="image/jpeg,image/png,image/webp,.zip,application/zip,application/x-zip-compressed" multiple disabled={busy || !ready} onChange={e => { if (e.target.files) void upload(e.target.files, kind); e.target.value = ''; }} />
       <span className="upload-icon">{kind === 'photo' ? <Upload size={24} /> : <ImagePlus size={24} />}</span>
       <strong>{count ? 'Добавить ещё' : kind === 'photo' ? 'Загрузить фотографии' : 'Загрузить новые афиши'}</strong>
-      <span>Перетащите сюда или выберите файлы</span><small>JPG, PNG, WebP · до 10 МБ · до {kind === 'photo' ? '500 фото' : '50 макетов'}</small>
+      <span>Перетащите изображения или несколько ZIP-архивов</span><small>ZIP до 500 МБ каждый · JPG, PNG, WebP до 10 МБ · до {kind === 'photo' ? '500 фото' : '50 макетов'}</small>
     </div>;
   }
   return <div className="studio">
